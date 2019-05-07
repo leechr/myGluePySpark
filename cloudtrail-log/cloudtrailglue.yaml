@@ -1,0 +1,332 @@
+# template version 0.9
+# to fix column names use re.sub(r'[\W]+', '', string)
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  BucketName:
+    Description: S3 Bucket name
+    Type: String
+    
+  etlJobSchedule:
+    Description: Schedule to run Glue ETL Job. Example cron(0 */1 * * ? *) for every hour
+    Type: String
+    Default: cron(0 */2 * * ? *)
+
+    
+
+Resources:
+ 
+  flatlambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt 'gluerole.Arn'
+      Runtime: "python2.7"
+      Timeout: 300
+      Handler: "index.lambda_handler"
+      Code: 
+        ZipFile: |
+          from __future__ import print_function
+          import json
+          import urllib
+          import boto3
+          import gzip
+          import os
+          import re
+          import time
+          s3 = boto3.resource('s3')
+          client = boto3.client('s3')
+          glue = boto3.client('glue')
+          
+          def convertColumntoLowwerCaps(obj):
+              for key in obj.keys():
+                  new_key = re.sub(r'[\W]+', '', key)
+                  v = obj[key]
+                  if isinstance(v, dict):
+                      if len(v) > 0:
+                          convertColumntoLowwerCaps(v)
+                  if new_key != key:
+                      obj[new_key] = obj[key]
+                      del obj[key]
+              return obj
+          
+          def lambda_handler(event, context):
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.unquote_plus(event['Records'][0]['s3']['object']['key'].encode('utf8'))
+              print(bucket)
+              print(key)
+              try:
+                  newKey = 'flatfiles/' + key.replace("/", "")
+                  client.download_file(bucket, key, '/tmp/file.json.gz')
+                  with gzip.open('/tmp/out.json.gz', 'w') as output, gzip.open('/tmp/file.json.gz', 'rb') as file:
+                      i = 0
+                      for line in file: 
+                          for record in json.loads(line,object_hook=convertColumntoLowwerCaps)['Records']:
+                            if i != 0:
+                                output.write("\n")
+                            if 'responseelements' in record and record['responseelements'] != None and 'version' in record['responseelements']:
+                                del record['responseelements']['version']
+                            if 'requestparameters' in record and record['requestparameters'] != None and 'maxitems' in record['requestparameters']:
+                                del record['requestparameters']['maxitems']               
+                            output.write(json.dumps(record))
+                            i += 1
+                  client.upload_file('/tmp/out.json.gz', bucket,newKey)
+                  return "success"
+              except Exception as e:
+                  print(e)
+                  raise e
+              return "success"
+
+  cloudtrailparquet:
+    Type: "AWS::Glue::Crawler"
+    Properties:
+      Role: !GetAtt gluerole.Arn
+      DatabaseName: !Join [ "_", [ !Ref "AWS::StackName" , db ] ]
+      Targets: 
+        S3Targets:
+          - Path: !Join [ "/", [ "s3:/",!Ref 'BucketName' , parquet/cloudtrail ] ]
+
+  cloudtrailjson:
+    Type: "AWS::Glue::Crawler"
+    Properties:
+      Role: !GetAtt gluerole.Arn
+      DatabaseName: !Join [ "_", [ !Ref "AWS::StackName" , db ] ]
+      Targets: 
+        S3Targets:
+          - Path: !Join [ "/", [ "s3:/",!Ref 'BucketName' , flatfiles/ ] ]
+
+  cloudtrailtoparquet:
+    Type: "AWS::Glue::Job"
+    DependsOn: copyGlueJob    
+    Properties:
+      Role: !Ref gluerole
+      AllocatedCapacity: 2
+      DefaultArguments:
+        "--TempDir": !Join [ "/", [ "s3:/",!Ref 'BucketName' , tmp/ ] ]
+        "--sourcetable": flatfiles
+        "--sourcedatabase": !Join [ "_", [ !Ref "AWS::StackName" , db ] ]
+        "--destinationpath": !Join [ "/", [ "s3:/",!Ref 'BucketName' , parquet/cloudtrail ] ]
+        "--job-bookmark-option": job-bookmark-enable
+        "--resultscrawler": !Ref cloudtrailparquet
+        "--sourcecrawler": !Ref cloudtrailjson
+      Command: 
+        Name: glueetl
+        ScriptLocation: !Join [ "/", [ "s3:/",!Ref 'BucketName' , gluecloudtrail/cloudtrailjobv2.py] ]
+
+  activateTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt 'gluerole.Arn'
+      Runtime: "python2.7"
+      Timeout: 300
+      Handler: "index.handler"
+      Code: 
+        ZipFile: |
+         import cfnresponse
+         import boto3
+         from botocore.client import Config
+         import zipfile
+         def handler(event, context):
+            client = boto3.client('glue')
+            scheduletrigger = event['ResourceProperties']['gluetrigger']
+            if event['RequestType'] != 'Delete':
+              try:
+                  client.start_trigger(Name=scheduletrigger)
+                  conf = '{"Version": 1.0,"Grouping": {"TableGroupingPolicy": "CombineCompatibleSchemas" }}'
+                  response = client.update_crawler(Name=event['ResourceProperties']['sourcecrawler'],Configuration=conf)
+                  response = client.update_crawler(Name=event['ResourceProperties']['resultscrawler'],Configuration=conf)
+              except:
+                  print 'trigger error'
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")                        
+
+  activateTrigger:
+    Type: Custom::activateTrigger
+    Properties:
+      ServiceToken: !GetAtt activateTriggerFunction.Arn
+      gluetrigger: !Ref ScheduledJobTrigger
+      sourcecrawler: !Ref cloudtrailjson
+      resultscrawler: !Ref cloudtrailparquet
+
+  ScheduledJobTrigger:
+    Type: 'AWS::Glue::Trigger'
+    Properties:
+      Type: SCHEDULED
+      Description: DESCRIPTION_SCHEDULED
+      Schedule: !Ref etlJobSchedule
+      Actions:
+        - JobName: !Ref cloudtrailtoparquet
+
+  CopyLambdasFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt 'gluerole.Arn'
+      Runtime: "python2.7"
+      Timeout: 300
+      Handler: "index.handler"
+      Code: 
+        ZipFile: |
+         import cfnresponse
+         import boto3
+         from botocore.client import Config
+         import zipfile
+         def handler(event, context):
+            client = boto3.client('s3')
+            destinationbucket = event['ResourceProperties']['destinationBucketName']
+            sourceBucket = event['ResourceProperties']['sourceBucketName']
+            objectKey = event['ResourceProperties']['objectKey']
+            if event['RequestType'] != 'Delete':
+               s3 = boto3.client('s3')
+               s3.copy({ 'Bucket': sourceBucket, 'Key': objectKey}, destinationbucket, objectKey)
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")                        
+
+  copyGlueJob:
+    Type: Custom::copyGlueJob
+    Properties:
+      ServiceToken: !GetAtt CopyLambdasFunction.Arn
+      destinationBucketName: !Ref BucketName
+      sourceBucketName: 'lfcarocomdemo'
+      objectKey: 'gluecloudtrail/cloudtrailjobv2.py'
+
+  DeleteBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt 'gluerole.Arn'
+      Runtime: "python2.7"
+      Timeout: 300
+      Handler: "index.handler"
+      Code: 
+        ZipFile: |
+         import cfnresponse
+         import boto3
+         from botocore.client import Config
+         import zipfile
+         def handler(event, context):
+            client = boto3.client('s3')
+            destinationbucket = event['ResourceProperties']['bucketName']
+            if event['RequestType'] == 'Delete':
+               s3 = boto3.resource('s3')
+               bucket = s3.Bucket(destinationbucket)
+               for key in bucket.objects.all():
+                  client.delete_object(Bucket=destinationbucket,  Key=key.key)
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")
+  
+  DeleteBucket:
+    Type: Custom::DeleteBucket
+    Properties:
+      ServiceToken: !GetAtt DeleteBucketFunction.Arn
+      bucketName: !Ref 'mibucket'
+
+  cloudtrail:
+    Type: "AWS::CloudTrail::Trail"
+    DependsOn: mibucketpolicy   
+    Properties:
+      IsLogging: true
+      S3BucketName: !Ref 'mibucket'
+
+  gluerole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+            - s3.amazonaws.com
+            - glue.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: s3allsinglebucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action:
+              - s3:*
+              Resource: 
+              - !Join [ "", [ "arn:aws:s3:::", !Ref BucketName , "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::",!Ref BucketName ] ]
+              Effect: Allow
+        - PolicyName: s3listbuckets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action:
+              - s3:ListObjects
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListAllMyBuckets
+              Resource: "*"
+              Effect: Allow
+        - PolicyName: passrole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action:
+              - iam:PassRole
+              - iam:GetRole
+              Resource: !Join [ "", [ "arn:aws:iam::*:role/", !Ref "AWS::StackName" ,"*"]]
+              Effect: Allow
+        - PolicyName: cloudwatchlogswrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: "*"
+              Effect: Allow
+
+  LambdaBucketPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref flatlambda
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+
+  mibucketpolicy: 
+    Type: "AWS::S3::BucketPolicy"
+    Properties: 
+      Bucket: 
+        Ref: "mibucket"
+      PolicyDocument: 
+        Statement: 
+          - 
+            Action: 
+              - "s3:GetBucketAcl"
+            Effect: "Allow"
+            Resource: !Join [ "", [ "arn:aws:s3:::",!Ref BucketName ] ]
+            Principal: 
+              Service: "cloudtrail.amazonaws.com"
+          - 
+            Action: 
+              - "s3:PutObject"
+            Effect: "Allow"
+            Resource: !Join [ "", [ "arn:aws:s3:::",!Ref BucketName, "/AWSLogs/", !Ref "AWS::AccountId", "/*"]]
+            Principal: 
+              Service: "cloudtrail.amazonaws.com"
+          
+  mibucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaBucketPermission
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Function: !GetAtt flatlambda.Arn
+            Event: "s3:ObjectCreated:*"
+            Filter: 
+              S3Key:
+                Rules:
+                  - Name: "prefix"
+                    Value: !Join [ "", [ "AWSLogs/", !Ref "AWS::AccountId", "/CloudTrail/"]]
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: 1
+            Status: "Enabled"
+            Prefix: "flatfiles/"

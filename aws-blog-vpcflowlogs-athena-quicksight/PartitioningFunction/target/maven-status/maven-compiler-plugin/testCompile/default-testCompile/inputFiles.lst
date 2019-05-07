@@ -1,0 +1,4 @@
+c:\DEV\aws-big-data-blog-master\aws-blog-vpcflowlogs-athena-quicksight\PartitioningFunction\src\test\java\com\amazonaws\services\lambda\utils\TimeUnitParserTest.java
+c:\DEV\aws-big-data-blog-master\aws-blog-vpcflowlogs-athena-quicksight\PartitioningFunction\src\test\java\com\amazonaws\services\lambda\model\PartitionTypeTest.java
+c:\DEV\aws-big-data-blog-master\aws-blog-vpcflowlogs-athena-quicksight\PartitioningFunction\src\test\java\com\amazonaws\services\lambda\model\S3ObjectTest.java
+c:\DEV\aws-big-data-blog-master\aws-blog-vpcflowlogs-athena-quicksight\PartitioningFunction\src\test\java\com\amazonaws\services\lambda\RemoveAthenaPartitionsTest.java
